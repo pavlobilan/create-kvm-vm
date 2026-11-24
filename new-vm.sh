@@ -13,7 +13,8 @@
 # - static MAC address 52:54:00:xx:xx:xx, unique among VMs on this host;
 # - VM does not start automatically when the host starts;
 # - on host shutdown guests are shut down, not saved (host-wide libvirt-guests setting, changed on request);
-# - optional ISO attached as the first boot device;
+# - optional ISO attached as the first boot device: the latest Debian netinst (downloaded only if it is
+#   not in ISO_DIR yet or its SHA256 does not match) or any other ISO file;
 # - optional start of the VM at the end (default Yes).
 #
 # Run as root:  sudo bash new-vm.sh
@@ -32,6 +33,8 @@ MAX_DISKS=16
 MAX_DISK_GB=65536
 DEFAULT_ROOT=/var/lib/libvirt/images
 DEFAULT_BRIDGE=br0
+ISO_DIR=/var/lib/libvirt/images/iso   # downloaded Debian images are kept here
+DEBIAN_URL=https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/
 GUESTS_CONF=/etc/default/libvirt-guests
 
 YELLOW=$'\e[33m'; GREEN=$'\e[32m'; RED=$'\e[31m'; GRAY=$'\e[90m'; RESET=$'\e[0m'
@@ -200,22 +203,79 @@ if read_yes_no "Enable virtual TPM?" n; then
   fi
 fi
 
-# --- ISO image (optional; repeats until the file exists or the field is cleared) ---
-ISO_PROMPT=$ROOT_PATH/
+# --- Installation ISO ---
+# Latest Debian netinst: reused from ISO_DIR if already downloaded and its SHA256 matches, otherwise downloaded
+get_debian_iso() {
+  local sums name file expected actual
+  need_packages curl || return 1
+  mkdir -p "$ISO_DIR"
+  echo "Looking up the current Debian image on cdimage.debian.org..."
+  sums=$(curl -fsSL --max-time 30 "${DEBIAN_URL}SHA256SUMS" 2>/dev/null) || sums=""
+  name=$(grep -o 'debian-[0-9.]*-amd64-netinst\.iso' <<<"$sums" | head -n1)
+  if [ -z "$name" ]; then
+    # No connection: use the newest image already downloaded, if any
+    file=$(ls -1 "$ISO_DIR"/debian-*-amd64-netinst.iso 2>/dev/null | sort -V | tail -n1)
+    if [ -n "$file" ]; then
+      warn "cdimage.debian.org is not reachable; using the downloaded $file (not checked for a newer version)."
+      ISO=$file; return 0
+    fi
+    warn "cdimage.debian.org is not reachable and no Debian image is in $ISO_DIR."
+    return 1
+  fi
+  file=$ISO_DIR/$name
+  expected=$(awk -v n="$name" '$2 == n {print $1}' <<<"$sums")
+  if [ -f "$file" ]; then
+    echo -n "Found $file, verifying SHA256... "
+    actual=$(sha256sum "$file" | cut -d' ' -f1)
+    if [ "$actual" = "$expected" ]; then echo "OK"; ISO=$file; return 0; fi
+    echo "mismatch, downloading again."
+  fi
+  echo "Downloading $name to $ISO_DIR..."
+  if ! curl -fL --progress-bar -o "$file.part" "$DEBIAN_URL$name"; then
+    rm -f "$file.part"; warn "Download failed."; return 1
+  fi
+  echo -n "Verifying SHA256... "
+  actual=$(sha256sum "$file.part" | cut -d' ' -f1)
+  if [ "$actual" != "$expected" ]; then
+    rm -f "$file.part"; echo; warn "Checksum mismatch, the download was removed."; return 1
+  fi
+  mv -f "$file.part" "$file"; chmod 644 "$file"
+  echo "OK"
+  ISO=$file
+}
+
+# Another ISO file (repeats until the file exists or the field is cleared)
+ask_iso_path() {
+  local start prompt
+  [ -d "$ISO_DIR" ] && start=$ISO_DIR/ || start=$ROOT_PATH/
+  prompt=$start
+  while true; do
+    ISO=$(read_prefilled "Path to ISO (clear the field = back)" "$prompt")
+    [ "$ISO" = "$start" ] && ISO=""
+    [ -z "$ISO" ] && return 1
+    prompt=$ISO
+    [ -f "$ISO" ] && return 0
+    warn "File '$ISO' not found. Enter another path or clear the field to go back."
+  done
+}
+
+ISO=""
 while true; do
-  ISO=$(read_prefilled "Path to ISO (clear the field = skip)" "$ISO_PROMPT")
-  [ "$ISO" = "$ROOT_PATH/" ] && ISO=""
-  [ -z "$ISO" ] && break
-  ISO_PROMPT=$ISO
-  if [ ! -f "$ISO" ]; then
-    warn "File '$ISO' not found. Enter another path or clear the field to skip."; continue
-  fi
-  # QEMU runs as libvirt-qemu: the file and its folders must be readable by it
-  if id libvirt-qemu &>/dev/null && ! runuser -u libvirt-qemu -- test -r "$ISO"; then
-    warn "Warning: '$ISO' is not readable by the libvirt-qemu user; the VM may fail to start."
-  fi
-  break
+  echo "Installation ISO:"
+  echo "  [1] Latest Debian netinst (downloaded to $ISO_DIR if not there yet)"
+  echo "  [2] Another ISO file"
+  echo "  [0] None"
+  case $(read_number "ISO number" 1 0 2) in
+    1) get_debian_iso && break ;;
+    2) ask_iso_path && break ;;
+    0) ISO=""; break ;;
+  esac
+  ISO=""
 done
+# QEMU runs as libvirt-qemu: the file and its folders must be readable by it
+if [ -n "$ISO" ] && id libvirt-qemu &>/dev/null && ! runuser -u libvirt-qemu -- test -r "$ISO"; then
+  warn "Warning: '$ISO' is not readable by the libvirt-qemu user; the VM may fail to start."
+fi
 
 # --- Host shutdown behaviour (host-wide, applies to all VMs) ---
 # libvirt-guests defaults: ON_BOOT=start (restarts VMs that were running), ON_SHUTDOWN=suspend (saves state)

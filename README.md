@@ -35,7 +35,9 @@ To always run a reviewed version, replace `main` with a commit hash.
 - Static MAC address from the libvirt range `52:54:00:xx:xx:xx`, unique among VMs on the host
 - Autostart with the host: off
 - Host shutdown: guests are shut down, not saved, and not restarted on boot (`ON_SHUTDOWN=shutdown`, `ON_BOOT=ignore` in `/etc/default/libvirt-guests`); this is a host-wide setting, asked only if it differs
-- Optional ISO attached as the first boot device
+- Optional ISO attached as the first boot device:
+  - the latest Debian netinst from `cdimage.debian.org`, kept in `/var/lib/libvirt/images/iso`; if the current image is already there and its SHA256 matches, it is reused, otherwise it is downloaded and verified; without internet access the newest image already in the folder is used
+  - or any other ISO file (Tab completes paths)
 - Serial console (`virsh console <VMName>`), VNC console for Cockpit, QEMU guest agent channel
 - Optional start of the VM after creation (default: yes)
 
@@ -57,7 +59,7 @@ If creating the VM fails, the created disks and the VM folder are removed.
 ### Requirements
 
 - Debian 12 or 13 with libvirt and QEMU/KVM
-- Packages `virtinst`, `qemu-utils`, `ovmf` (the script offers to install missing ones)
+- Packages `virtinst`, `qemu-utils`, `ovmf`, and `curl` for downloading Debian (the script offers to install missing ones)
 - Run as root
 
 ### Defaults
@@ -73,6 +75,8 @@ Edit the variables at the top of the script to change defaults:
 | `EXTRA_DISK_GB` | `100` | size of further disks, GB |
 | `DEFAULT_ROOT` | `/var/lib/libvirt/images` | folder for virtual machines |
 | `DEFAULT_BRIDGE` | `br0` | network selected by default |
+| `ISO_DIR` | `/var/lib/libvirt/images/iso` | folder for downloaded Debian images |
+| `DEBIAN_URL` | `https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/` | where the latest Debian netinst is looked up |
 
 ## License
 
