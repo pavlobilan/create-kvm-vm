@@ -15,6 +15,9 @@
 # - on host shutdown guests are shut down, not saved (host-wide libvirt-guests setting, changed on request);
 # - optional ISO attached as the first boot device: the latest Debian netinst (downloaded only if it is
 #   not in ISO_DIR yet or its SHA256 does not match) or any other ISO file;
+# - unattended Debian install: an image built once from the netinst with a preseed (rebuilt only for a new
+#   Debian version or new settings); the installer asks only the hostname, domain, user name and password,
+#   the first disk becomes the system disk (LVM), the other disks are left untouched;
 # - optional start of the VM at the end (default Yes).
 #
 # Run as root:  sudo bash new-vm.sh
@@ -244,6 +247,135 @@ get_debian_iso() {
   ISO=$file
 }
 
+# Answers for the unattended Debian installation in a VM. The installer asks only the hostname, domain,
+# user name and password; the first disk of the VM becomes the system disk, the other disks are left untouched.
+write_preseed() {
+  cat <<'EOF'
+#### Language, country, keyboard
+d-i debian-installer/language string en
+d-i debian-installer/country string UA
+d-i debian-installer/locale string en_US.UTF-8
+d-i localechooser/supported-locales multiselect en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+
+#### Network via DHCP; the hostname and domain are asked, with debian offered as the default hostname
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string debian
+d-i netcfg/get_hostname seen false
+d-i hw-detect/load_firmware boolean true
+
+#### Package mirror
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+
+#### User: root login disabled, so the user is added to the sudo group
+d-i passwd/root-login boolean false
+d-i passwd/make-user boolean true
+d-i passwd/user-fullname string
+
+#### Time
+d-i clock-setup/utc boolean true
+d-i time/zone string Europe/Kyiv
+d-i clock-setup/ntp boolean true
+
+#### System disk: the first disk of the VM (vda/sda); set right before partitioning, when the disks are detected
+d-i partman/early_command string d=$(list-devices disk | head -n1); debconf-set partman-auto/disk "$d"; debconf-set grub-installer/bootdev "$d"
+
+#### Partitioning: LVM on the whole system disk without confirmations
+d-i partman-auto/method string lvm
+d-i partman-auto-lvm/guided_size string max
+d-i partman-auto/choose_recipe select atomic
+d-i partman-lvm/device_remove_lvm boolean true
+d-i partman-md/device_remove_md boolean true
+d-i partman-lvm/confirm boolean true
+d-i partman-lvm/confirm_nooverwrite boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+
+#### Packages
+d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/cdrom/set-next boolean false
+d-i apt-setup/cdrom/set-failed boolean false
+popularity-contest popularity-contest/participate boolean false
+tasksel tasksel/first multiselect standard, ssh-server
+d-i pkgsel/include string sudo qemu-guest-agent
+d-i pkgsel/upgrade select full-upgrade
+
+#### Boot loader
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/with_other_os boolean true
+
+#### After installation: login on serial port ttyS0 (virsh console), sudo without re-asking the password for the session,
+#### kernel messages also on the serial console, boot progress shown, GRUB menu for 2 s
+d-i preseed/late_command string \
+  in-target systemctl enable serial-getty@ttyS0.service; \
+  echo 'Defaults timestamp_timeout=-1' > /target/etc/sudoers.d/timeout; \
+  chmod 440 /target/etc/sudoers.d/timeout; \
+  sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet systemd.show_status=true console=tty0 console=ttyS0,115200"/' /target/etc/default/grub; \
+  sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' /target/etc/default/grub; \
+  in-target update-grub
+
+# Eject the ISO at the end and reboot into the installed system without the "Installation complete" screen
+d-i cdrom-detect/eject boolean true
+d-i finish-install/reboot_in_progress note
+EOF
+}
+
+# Builds <debian-version>-vm-<hash>.iso from the netinst in $ISO: preseed added to the installer initrd,
+# boot menu reduced to "Install" waiting for Enter. The hash changes when these functions change,
+# so the image is rebuilt only for a new Debian version or new settings.
+build_vm_iso() {
+  local src=$ISO hash out work f i
+  need_packages xorriso cpio || return 1
+  hash=$(declare -f write_preseed build_vm_iso | sha256sum | cut -c1-8)
+  out=$ISO_DIR/$(basename "${src%-amd64-netinst.iso}")-vm-$hash.iso
+  if [ -f "$out" ]; then
+    echo "Using the prepared image $out"
+    ISO=$out; return 0
+  fi
+  echo "Preparing the unattended installation image (about a minute)..."
+  work=$(mktemp -d)
+  mkdir -p "$work/extra"
+  write_preseed > "$work/extra/preseed.cfg"
+  local map=()
+  # Preseed appended to the initrd of the text and graphical installers
+  for i in install.amd/initrd.gz install.amd/gtk/initrd.gz; do
+    f=$work/$(tr / _ <<<"$i")
+    xorriso -osirrox on -indev "$src" -extract "/$i" "$f" &>/dev/null || continue
+    chmod u+w "$f"
+    (cd "$work/extra" && find . -mindepth 1 | cpio -o -H newc -R 0:0 --quiet | gzip) >> "$f"
+    map+=(-map "$f" "/$i")
+  done
+  # UEFI boot menu: only "Install", no timeout, language and keyboard answered on the kernel command line
+  f=$work/grub.cfg
+  if [ ${#map[@]} -eq 0 ] || ! xorriso -osirrox on -indev "$src" -extract /boot/grub/grub.cfg "$f" &>/dev/null; then
+    rm -rf "$work"; warn "'$src' does not look like a Debian netinst image."; return 1
+  fi
+  chmod u+w "$f"
+  awk '
+    skip { d += gsub(/{/, "{") - gsub(/}/, "}"); if (d <= 0) skip = 0; next }
+    /^[[:space:]]*(menuentry|submenu)[[:space:]]/ && $0 !~ /'"'"'Install'"'"'/ {
+      d = gsub(/{/, "{") - gsub(/}/, "}"); if (d > 0) skip = 1; next }
+    { print }' "$f" > "$f.new" && mv "$f.new" "$f"
+  sed -i "s#\(/install.amd/vmlinuz\)#\1 locale=en_US.UTF-8 keymap=us#" "$f"
+  sed -i "/^[[:space:]]*menuentry.*'Install'.*{/a\\    echo 'Loading the installer, please wait...'" "$f"
+  printf '\nset timeout=-1\nset default="Install"\n' >> "$f"
+  map+=(-map "$f" /boot/grub/grub.cfg)
+  if ! xorriso -indev "$src" -outdev "$out.part" "${map[@]}" -boot_image any replay &>/dev/null; then
+    rm -rf "$work" "$out.part"; warn "Building the image failed."; return 1
+  fi
+  rm -rf "$work"
+  mv -f "$out.part" "$out"; chmod 644 "$out"
+  # Earlier prepared images are no longer needed
+  for f in "$ISO_DIR"/debian-*-vm-*.iso; do [ "$f" = "$out" ] || rm -f "$f"; done
+  echo "Saved $out"
+  ISO=$out
+}
+
 # Another ISO file (repeats until the file exists or the field is cleared)
 ask_iso_path() {
   local start prompt
@@ -259,15 +391,25 @@ ask_iso_path() {
   done
 }
 
-ISO=""
+ISO=""; ISO_MODE=""
 while true; do
   echo "Installation ISO:"
-  echo "  [1] Latest Debian netinst (downloaded to $ISO_DIR if not there yet)"
-  echo "  [2] Another ISO file"
-  echo "  [0] None"
-  case $(read_number "ISO number" 1 0 2) in
-    1) get_debian_iso && break ;;
-    2) ask_iso_path && break ;;
+  if [ "$OS_TYPE" = 1 ]; then
+    echo "  [1] Debian, unattended install (asks only hostname, domain, user and password)"
+    echo "  [2] Debian, standard installer"
+    echo "  [3] Another ISO file"
+    echo "  [0] None"
+    choice=$(read_number "ISO number" 1 0 3)
+  else
+    echo "  [1] ISO file"
+    echo "  [0] None"
+    choice=$(read_number "ISO number" 1 0 1)
+    [ "$choice" = 1 ] && choice=3
+  fi
+  case $choice in
+    1) get_debian_iso && build_vm_iso && { ISO_MODE=unattended; break; } ;;
+    2) get_debian_iso && break ;;
+    3) ask_iso_path && break ;;
     0) ISO=""; break ;;
   esac
   ISO=""
@@ -318,9 +460,12 @@ ARGS=(
   --noautoconsole
   --print-xml
 )
-[ -n "$ISO" ] && ARGS+=(--disk "path=$ISO,device=cdrom,bus=sata,readonly=on,boot.order=1")
+# ISO is the first boot device; for the unattended install it is the last one: the empty system disk
+# does not boot, so the ISO starts, and after the installation the VM boots from the disk even with the ISO attached
+if [ "$ISO_MODE" = unattended ]; then ISO_ORDER=$((DISK_COUNT + 1)); DISK_ORDER=1; else ISO_ORDER=1; DISK_ORDER=2; fi
+[ -n "$ISO" ] && ARGS+=(--disk "path=$ISO,device=cdrom,bus=sata,readonly=on,boot.order=$ISO_ORDER")
 for ((i = 0; i < DISK_COUNT; i++)); do
-  ARGS+=(--disk "path=${DISK_PATHS[i]},format=qcow2,bus=$DISK_BUS,cache=none,discard=unmap,boot.order=$((i + 2))")
+  ARGS+=(--disk "path=${DISK_PATHS[i]},format=qcow2,bus=$DISK_BUS,cache=none,discard=unmap,boot.order=$((i + DISK_ORDER))")
 done
 if [ -n "$NET" ]; then ARGS+=(--network "$NET,model=$NIC_MODEL,mac=$MAC"); else ARGS+=(--network none); fi
 # virt-install adds a TPM to UEFI VMs by default, so "none" is passed explicitly
@@ -385,7 +530,11 @@ printf '  %-19s %s\n' "Network:" "$NET_LABEL"
 for ((i = 0; i < DISK_COUNT; i++)); do
   printf '  %-19s %s\n' "Disk:" "${DISK_PATHS[i]} (${DISK_SIZES[i]} GB, qcow2 thin, $DISK_BUS)"
 done
-[ -n "$ISO" ] && printf '  %-19s %s\n' "ISO:" "$ISO (first boot device)"
+if [ "$ISO_MODE" = unattended ]; then
+  printf '  %-19s %s\n' "ISO:" "$ISO (unattended Debian install, boots after the disks)"
+elif [ -n "$ISO" ]; then
+  printf '  %-19s %s\n' "ISO:" "$ISO (first boot device)"
+fi
 [ -n "${TPM_WARNING:-}" ] && { echo; warn "$TPM_WARNING"; }
 
 # --- Start the VM (green prompt, default Yes) ---
@@ -398,6 +547,7 @@ done
 if [[ $answer == "" || $answer == y || $answer == yes ]]; then
   if out=$(virsh start "$VM_NAME" 2>&1); then
     echo "VM '$VM_NAME' started. Console: Cockpit > Virtual machines > $VM_NAME, or: virsh console $VM_NAME"
+    [ "$ISO_MODE" = unattended ] && echo "In the console press Enter in the boot menu, then enter the hostname, domain, user name and password."
   else
     echo "${RED}VM '$VM_NAME' was created but could not be started: $out${RESET}"
     exit 1
