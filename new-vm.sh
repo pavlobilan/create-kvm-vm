@@ -21,7 +21,7 @@
 # - optional start of the VM at the end (default Yes).
 #
 # Run as root:  sudo bash new-vm.sh
-# The whole script is a function, so it also works as:  curl -fsSL <url> | sudo bash
+# The whole script is a function, so it also works as:  wget -qO- <url> | sudo bash
 
 main() {
 set -uo pipefail

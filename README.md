@@ -10,16 +10,16 @@ Install `curl` if it is missing (a host installed with kvm-host-iso does not hav
 sudo apt-get install -y curl
 ```
 
-Download the script and run it as root:
+Download the script and run it as root (`wget` is present on a host installed with kvm-host-iso, `curl` is not):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh -o /tmp/new-vm.sh && sudo bash /tmp/new-vm.sh
+wget -qO /tmp/new-vm.sh https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh && sudo bash /tmp/new-vm.sh
 ```
 
 Or run without saving to disk (answers are read from the terminal):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh | sudo bash
+wget -qO- https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh | sudo bash
 ```
 
 At the end the script asks whether to start the VM (Enter = yes).
