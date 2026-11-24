@@ -172,14 +172,20 @@ for b in /sys/class/net/*/bridge; do
   [ -e "$b" ] || continue
   br=$(basename "$(dirname "$b")")
   [[ $br == virbr* ]] && continue   # bridges of libvirt networks are listed below
-  NET_ARGS+=("bridge=$br"); NET_LABELS+=("$br (host bridge)")
+  NET_ARGS+=("bridge=$br"); NET_LABELS+=("$br - same LAN as the host, IP from the router, reachable from the LAN")
 done
 while read -r net; do
   [ -n "$net" ] || continue
-  NET_ARGS+=("network=$net"); NET_LABELS+=("$net (libvirt network)")
+  mode=$(virsh net-dumpxml "$net" 2>/dev/null | sed -n "s/.*<forward mode='\([a-z]*\)'.*/\1/p" | head -n1)
+  case $mode in
+    nat)   desc="NAT: internet only, not reachable from the LAN" ;;
+    "")    desc="isolated: only the host and VMs on this network" ;;
+    *)     desc="libvirt network, mode $mode" ;;
+  esac
+  NET_ARGS+=("network=$net"); NET_LABELS+=("$net - $desc")
 done < <(virsh net-list --all --name 2>/dev/null)
 
-NET=""; NET_LABEL="not connected"
+NET=""; NET_LABEL="no network"
 if [ ${#NET_ARGS[@]} -gt 0 ]; then
   echo "Available networks:"
   default_net=1
@@ -187,7 +193,7 @@ if [ ${#NET_ARGS[@]} -gt 0 ]; then
     echo "  [$((i + 1))] ${NET_LABELS[i]}"
     [ "${NET_ARGS[i]}" = "bridge=$DEFAULT_BRIDGE" ] && default_net=$((i + 1))
   done
-  echo "  [0] do not connect"
+  echo "  [0] no network"
   n=$(read_number "Network number" "$default_net" 0 ${#NET_ARGS[@]})
   if [ "$n" -gt 0 ]; then NET=${NET_ARGS[n - 1]}; NET_LABEL=${NET_LABELS[n - 1]}; fi
 else

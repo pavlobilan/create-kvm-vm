@@ -31,7 +31,7 @@ To always run a reviewed version, replace `main` with a commit hash.
 - Firmware: UEFI, machine type q35
 - Secure Boot: asked at runtime, off by default; when enabled, Microsoft keys are enrolled (Windows and Linux with shim)
 - Virtual TPM 2.0: asked at runtime, off by default (installs `swtpm` if missing)
-- Network: a host bridge (`br0` by default) or a libvirt network, or not connected
+- Network: a host bridge (`br0` by default, same LAN as the host) or a libvirt network (NAT or isolated), or no network
 - Static MAC address from the libvirt range `52:54:00:xx:xx:xx`, unique among VMs on the host
 - Autostart with the host: off
 - Host shutdown: guests are shut down, not saved, and not restarted on boot (`ON_SHUTDOWN=shutdown`, `ON_BOOT=ignore` in `/etc/default/libvirt-guests`); this is a host-wide setting, asked only if it differs
