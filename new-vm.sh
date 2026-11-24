@@ -213,6 +213,42 @@ if read_yes_no "Enable virtual TPM?" n; then
 fi
 
 # --- Installation ISO ---
+# Download with a green progress bar (percent, MB, speed); the cursor is hidden while it is drawn
+download() {
+  local url=$1 out=$2 total pid size last=0 speed=0 width filled pct line rc done_bar rest_bar
+  total=$(curl -fsSLI "$url" 2>/dev/null | tr -d '\r' | awk 'tolower($1) == "content-length:" {n = $2} END {print n + 0}')
+  curl -fsSL -o "$out" "$url" &
+  pid=$!
+  printf '\e[?25l'
+  trap 'kill $pid 2>/dev/null; rm -f "$out"; printf "\e[?25h\n"; exit 130' INT TERM
+  draw() {
+    size=$(stat -c %s "$out" 2>/dev/null || echo 0)
+    width=$(( $(tput cols 2>/dev/null || echo 80) - 34 ))
+    [ "$width" -gt 60 ] && width=60
+    [ "$width" -lt 10 ] && width=10
+    if [ "$total" -gt 0 ]; then
+      pct=$((size * 100 / total)); filled=$((size * width / total))
+      line=$(printf '%3d%%  %d/%d MB  %d MB/s' "$pct" $((size / 1048576)) $((total / 1048576)) "$speed")
+    else
+      pct=0; filled=0
+      line=$(printf '%d MB  %d MB/s' $((size / 1048576)) "$speed")
+    fi
+    done_bar=$(printf '%*s' "$filled" ''); rest_bar=$(printf '%*s' $((width - filled)) '')
+    printf '\r  %s%s%s%s%s %s\e[K' "$GREEN" "${done_bar// /█}" "$GRAY" "${rest_bar// /░}" "$RESET" "$line"
+  }
+  while kill -0 "$pid" 2>/dev/null; do
+    draw
+    sleep 1
+    size=$(stat -c %s "$out" 2>/dev/null || echo 0)
+    speed=$(( (size - last) / 1048576 )); last=$size
+  done
+  wait "$pid"; rc=$?
+  [ "$rc" -eq 0 ] && draw
+  printf '\e[?25h\n'
+  trap - INT TERM
+  return "$rc"
+}
+
 # Latest Debian netinst: reused from ISO_DIR if already downloaded and its SHA256 matches, otherwise downloaded
 get_debian_iso() {
   local sums name file expected actual
@@ -240,7 +276,7 @@ get_debian_iso() {
     echo "mismatch, downloading again."
   fi
   echo "Downloading $name to $ISO_DIR..."
-  if ! curl -fL --progress-bar -o "$file.part" "$DEBIAN_URL$name"; then
+  if ! download "$DEBIAN_URL$name" "$file.part"; then
     rm -f "$file.part"; warn "Download failed."; return 1
   fi
   echo -n "Verifying SHA256... "
