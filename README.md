@@ -1,0 +1,79 @@
+# create-kvm-vm
+
+Interactive script that creates a KVM/libvirt virtual machine on a Debian host (e.g. one installed with [kvm-host-iso](https://github.com/pavlobilan/kvm-host-iso)). The created VM appears in Cockpit (Virtual machines).
+
+## Quick start
+
+Download the script and run it as root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh -o /tmp/new-vm.sh && sudo bash /tmp/new-vm.sh
+```
+
+Or run without saving to disk (answers are read from the terminal):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pavlobilan/create-kvm-vm/main/new-vm.sh | sudo bash
+```
+
+At the end the script asks whether to start the VM (Enter = yes).
+
+To always run a reviewed version, replace `main` with a commit hash.
+
+## new-vm.sh
+
+### What it configures
+
+- vCPU: asked at runtime, from 1 to the host's logical processor count (default 4, or the host maximum if lower); CPU model `host-passthrough`
+- Memory: static, size asked at runtime (default 8 GB, limited to host memory)
+- Disks: number and sizes asked at runtime (default 2 disks: 60 GB and 200 GB), all thin-provisioned qcow2 with `discard=unmap`
+- Guest OS: Linux (virtio disks and network) or Windows (SATA disks, e1000e network, installs without extra drivers)
+- Firmware: UEFI, machine type q35
+- Secure Boot: asked at runtime, off by default; when enabled, Microsoft keys are enrolled (Windows and Linux with shim)
+- Virtual TPM 2.0: asked at runtime, off by default (installs `swtpm` if missing)
+- Network: a host bridge (`br0` by default) or a libvirt network, or not connected
+- Static MAC address from the libvirt range `52:54:00:xx:xx:xx`, unique among VMs on the host
+- Autostart with the host: off
+- Host shutdown: guests are shut down, not saved, and not restarted on boot (`ON_SHUTDOWN=shutdown`, `ON_BOOT=ignore` in `/etc/default/libvirt-guests`); this is a host-wide setting, asked only if it differs
+- Optional ISO attached as the first boot device
+- Serial console (`virsh console <VMName>`), VNC console for Cockpit, QEMU guest agent channel
+- Optional start of the VM after creation (default: yes)
+
+Nested virtualization works when it is enabled in the host's `kvm_intel`/`kvm_amd` module; the summary shows whether it is.
+
+### Folder layout
+
+```text
+<Folder>/<VMName>/
+├── <VMName>.qcow2
+├── <VMName>-Data.qcow2
+└── <VMName>-Data2.qcow2 ...
+```
+
+The folder is asked at runtime; the default (`/var/lib/libvirt/images`) is pre-filled and can be edited (Tab completes paths). If the folder already contains a subfolder with the VM name, the script asks for another folder. The UEFI variables (and TPM state, if enabled) are kept by libvirt in `/var/lib/libvirt/qemu/nvram` and `/var/lib/libvirt/swtpm`.
+
+If creating the VM fails, the created disks and the VM folder are removed.
+
+### Requirements
+
+- Debian 12 or 13 with libvirt and QEMU/KVM
+- Packages `virtinst`, `qemu-utils`, `ovmf` (the script offers to install missing ones)
+- Run as root
+
+### Defaults
+
+Edit the variables at the top of the script to change defaults:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DEFAULT_CPU` | `4` | vCPU count |
+| `DEFAULT_MEM_GB` | `8` | memory, GB |
+| `DEFAULT_DISKS` | `2` | number of disks |
+| `DEFAULT_SIZES_GB` | `(60 200)` | sizes of disk 1, 2, ..., GB |
+| `EXTRA_DISK_GB` | `100` | size of further disks, GB |
+| `DEFAULT_ROOT` | `/var/lib/libvirt/images` | folder for virtual machines |
+| `DEFAULT_BRIDGE` | `br0` | network selected by default |
+
+## License
+
+MIT

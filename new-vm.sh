@@ -1,0 +1,351 @@
+#!/bin/bash
+# Creates a KVM/libvirt virtual machine on a Debian host, interactively.
+#
+# - vCPU count asked (default 4, or fewer if the host has fewer; up to the host's logical processors);
+#   CPU model host-passthrough (nested virtualization works if the host allows it);
+# - memory size (static), number of disks and their sizes are asked;
+# - disks are thin qcow2: <VMName>.qcow2 (system), <VMName>-Data.qcow2, <VMName>-Data2.qcow2, ...;
+#   all stored in <Folder>/<VMName>/;
+# - UEFI firmware (q35); Secure Boot on request (off by default; Microsoft keys enrolled, for Windows and Linux);
+# - virtual TPM 2.0 on request (off by default; needs swtpm);
+# - guest OS type: Linux (virtio disks and network) or Windows (SATA disks, e1000e network, no extra drivers);
+# - network: a host bridge (e.g. br0) or a libvirt network, or not connected;
+# - static MAC address 52:54:00:xx:xx:xx, unique among VMs on this host;
+# - VM does not start automatically when the host starts;
+# - on host shutdown guests are shut down, not saved (host-wide libvirt-guests setting, changed on request);
+# - optional ISO attached as the first boot device;
+# - optional start of the VM at the end (default Yes).
+#
+# Run as root:  sudo bash new-vm.sh
+# The whole script is a function, so it also works as:  curl -fsSL <url> | sudo bash
+
+main() {
+set -uo pipefail
+
+# --- VM settings ---
+DEFAULT_CPU=4
+DEFAULT_MEM_GB=8
+DEFAULT_DISKS=2
+DEFAULT_SIZES_GB=(60 200)   # defaults for disk 1, 2, ...
+EXTRA_DISK_GB=100           # default for disks beyond the list above
+MAX_DISKS=16
+MAX_DISK_GB=65536
+DEFAULT_ROOT=/var/lib/libvirt/images
+DEFAULT_BRIDGE=br0
+GUESTS_CONF=/etc/default/libvirt-guests
+
+YELLOW=$'\e[33m'; GREEN=$'\e[32m'; RED=$'\e[31m'; GRAY=$'\e[90m'; RESET=$'\e[0m'
+
+warn() { echo "  ${YELLOW}$*${RESET}"; }
+die()  { echo; printf '%s\n' "${RED}Error: $*${RESET}"; exit 1; }
+# Input ended (Ctrl+D or closed terminal): stop the whole script, also from inside $(...)
+eof()  { echo >&2; echo "Input ended, nothing was created." >&2; kill -TERM $$; exit 1; }
+
+# Prompt with a pre-filled, editable default value (readline, Tab completes paths)
+read_prefilled() {
+  local prompt=$1 default=$2 value
+  read -r -e -p "$prompt: " -i "$default" value || eof
+  printf '%s' "${value:-$default}"
+}
+
+# Prompt for an integer in [min, max] with a default; repeats until the input is valid
+read_number() {
+  local prompt=$1 default=$2 min=$3 max=$4 raw
+  while true; do
+    read -r -p "$prompt [$default]: " raw || eof
+    raw=${raw//[[:space:]]/}
+    [ -z "$raw" ] && { echo "$default"; return; }
+    if [[ $raw =~ ^[0-9]+$ ]] && [ "$raw" -ge "$min" ] && [ "$raw" -le "$max" ]; then
+      echo "$((10#$raw))"; return
+    fi
+    warn "Enter a whole number from $min to $max." >&2
+  done
+}
+
+# Yes/No prompt; Enter returns the default (y or n)
+read_yes_no() {
+  local prompt=$1 default=$2 hint raw
+  [ "$default" = y ] && hint="Y/n" || hint="y/N"
+  while true; do
+    read -r -p "$prompt [$hint]: " raw || eof
+    raw=$(tr '[:upper:]' '[:lower:]' <<<"${raw//[[:space:]]/}")
+    [ -z "$raw" ] && raw=$default
+    case $raw in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+    esac
+    warn "Enter y or n." >&2
+  done
+}
+
+# Offer to install missing packages
+need_packages() {
+  local missing=() p
+  for p in "$@"; do dpkg -s "$p" &>/dev/null || missing+=("$p"); done
+  [ ${#missing[@]} -eq 0 ] && return 0
+  echo "Missing packages: ${missing[*]}"
+  read_yes_no "Install them now?" y || return 1
+  apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null
+}
+
+[ "$(id -u)" -eq 0 ] || die "Run as root: sudo bash $0"
+command -v virsh >/dev/null || die "libvirt is not installed (virsh not found)."
+need_packages virtinst qemu-utils ovmf || die "Required packages are not installed."
+
+# --- VM name ---
+while true; do
+  read -r -p "VM name [VM01]: " VM_NAME || eof
+  VM_NAME=$(xargs <<<"$VM_NAME")
+  VM_NAME=${VM_NAME:-VM01}
+  if [[ ! $VM_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    warn "Use letters, digits, dot, hyphen and underscore only."; continue
+  fi
+  virsh dominfo "$VM_NAME" &>/dev/null && die "VM '$VM_NAME' already exists."
+  break
+done
+
+# --- Folder where VMs are stored (a <VMName> subfolder is created in it) ---
+# Repeats until the path is valid and has no <VMName> subfolder yet; the last entry is pre-filled again
+PATH_PROMPT=$DEFAULT_ROOT
+while true; do
+  ROOT_PATH=$(read_prefilled "Folder for virtual machines" "$PATH_PROMPT")
+  ROOT_PATH=${ROOT_PATH%/}
+  PATH_PROMPT=$ROOT_PATH
+  if [[ $ROOT_PATH != /* ]]; then
+    warn "Specify a full path, e.g. $DEFAULT_ROOT"; continue
+  fi
+  if [ ! -d "$ROOT_PATH" ]; then
+    warn "Folder '$ROOT_PATH' not found. Choose another folder."; continue
+  fi
+  VM_DIR=$ROOT_PATH/$VM_NAME
+  if [ -e "$VM_DIR" ]; then
+    warn "Folder '$VM_DIR' already exists. Choose another folder."; continue
+  fi
+  break
+done
+
+# --- vCPU count (1 to the host's logical processors; default 4 or the host maximum if lower) ---
+HOST_CPU=$(nproc --all)
+CPU_COUNT=$(read_number "vCPU count (host: $HOST_CPU)" $((DEFAULT_CPU < HOST_CPU ? DEFAULT_CPU : HOST_CPU)) 1 "$HOST_CPU")
+
+# --- Memory (static, limited to the host's physical memory) ---
+HOST_MEM_GB=$(awk '/^MemTotal:/{printf "%d", $2/1048576}' /proc/meminfo)
+FREE_MEM_GB=$(awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo)
+[ "$HOST_MEM_GB" -ge 1 ] || HOST_MEM_GB=1
+MEM_GB=$(read_number "Memory, GB (host: $HOST_MEM_GB GB, free: $FREE_MEM_GB GB)" \
+  $((DEFAULT_MEM_GB < HOST_MEM_GB ? DEFAULT_MEM_GB : HOST_MEM_GB)) 1 "$HOST_MEM_GB")
+[ "$MEM_GB" -gt "$FREE_MEM_GB" ] && warn "Warning: only $FREE_MEM_GB GB is free now; the VM may fail to start."
+
+# --- Disks ---
+DISK_COUNT=$(read_number "Number of disks" "$DEFAULT_DISKS" 1 "$MAX_DISKS")
+DISK_PATHS=(); DISK_SIZES=()
+for ((i = 1; i <= DISK_COUNT; i++)); do
+  case $i in
+    1) name="$VM_NAME.qcow2" ;;
+    2) name="$VM_NAME-Data.qcow2" ;;
+    *) name="$VM_NAME-Data$((i - 1)).qcow2" ;;
+  esac
+  def=${DEFAULT_SIZES_GB[i - 1]:-$EXTRA_DISK_GB}
+  size=$(read_number "  Disk $i ($name) size, GB" "$def" 1 "$MAX_DISK_GB")
+  DISK_PATHS+=("$VM_DIR/$name"); DISK_SIZES+=("$size")
+done
+DISK_FREE_GB=$(df -P -BG "$ROOT_PATH" | awk 'NR==2{sub("G","",$4); print $4}')
+DISK_TOTAL_GB=0; for s in "${DISK_SIZES[@]}"; do DISK_TOTAL_GB=$((DISK_TOTAL_GB + s)); done
+[ "$DISK_TOTAL_GB" -gt "$DISK_FREE_GB" ] && \
+  warn "Note: disks total $DISK_TOTAL_GB GB, free in '$ROOT_PATH': $DISK_FREE_GB GB (disks are thin, space is used as data is written)."
+
+# --- Guest OS type ---
+echo "Guest OS:"
+echo "  [1] Linux (virtio disks and network)"
+echo "  [2] Windows (SATA disks, e1000e network; no extra drivers needed)"
+OS_TYPE=$(read_number "OS number" 1 1 2)
+
+# --- Network: host bridges and libvirt networks ---
+NET_ARGS=(); NET_LABELS=()
+for b in /sys/class/net/*/bridge; do
+  [ -e "$b" ] || continue
+  br=$(basename "$(dirname "$b")")
+  [[ $br == virbr* ]] && continue   # bridges of libvirt networks are listed below
+  NET_ARGS+=("bridge=$br"); NET_LABELS+=("$br (host bridge)")
+done
+while read -r net; do
+  [ -n "$net" ] || continue
+  NET_ARGS+=("network=$net"); NET_LABELS+=("$net (libvirt network)")
+done < <(virsh net-list --all --name 2>/dev/null)
+
+NET=""; NET_LABEL="not connected"
+if [ ${#NET_ARGS[@]} -gt 0 ]; then
+  echo "Available networks:"
+  default_net=1
+  for ((i = 0; i < ${#NET_ARGS[@]}; i++)); do
+    echo "  [$((i + 1))] ${NET_LABELS[i]}"
+    [ "${NET_ARGS[i]}" = "bridge=$DEFAULT_BRIDGE" ] && default_net=$((i + 1))
+  done
+  echo "  [0] do not connect"
+  n=$(read_number "Network number" "$default_net" 0 ${#NET_ARGS[@]})
+  if [ "$n" -gt 0 ]; then NET=${NET_ARGS[n - 1]}; NET_LABEL=${NET_LABELS[n - 1]}; fi
+else
+  warn "No bridge or libvirt network found; the VM will not be connected."
+fi
+
+# --- Secure Boot ---
+SECURE_BOOT=no
+read_yes_no "Enable Secure Boot?" n && SECURE_BOOT=yes
+
+# --- Virtual TPM ---
+TPM=no
+if read_yes_no "Enable virtual TPM?" n; then
+  if need_packages swtpm swtpm-tools; then TPM=yes
+  else TPM_WARNING="Virtual TPM was not enabled: swtpm is not installed."
+  fi
+fi
+
+# --- ISO image (optional; repeats until the file exists or the field is cleared) ---
+ISO_PROMPT=$ROOT_PATH/
+while true; do
+  ISO=$(read_prefilled "Path to ISO (clear the field = skip)" "$ISO_PROMPT")
+  [ "$ISO" = "$ROOT_PATH/" ] && ISO=""
+  [ -z "$ISO" ] && break
+  ISO_PROMPT=$ISO
+  if [ ! -f "$ISO" ]; then
+    warn "File '$ISO' not found. Enter another path or clear the field to skip."; continue
+  fi
+  # QEMU runs as libvirt-qemu: the file and its folders must be readable by it
+  if id libvirt-qemu &>/dev/null && ! runuser -u libvirt-qemu -- test -r "$ISO"; then
+    warn "Warning: '$ISO' is not readable by the libvirt-qemu user; the VM may fail to start."
+  fi
+  break
+done
+
+# --- Host shutdown behaviour (host-wide, applies to all VMs) ---
+# libvirt-guests defaults: ON_BOOT=start (restarts VMs that were running), ON_SHUTDOWN=suspend (saves state)
+conf_value() { grep -E "^[[:space:]]*$1=" "$GUESTS_CONF" 2>/dev/null | tail -n1 | cut -d= -f2 | tr -d '"'; }
+ON_BOOT=$(conf_value ON_BOOT); ON_BOOT=${ON_BOOT:-start}
+ON_SHUTDOWN=$(conf_value ON_SHUTDOWN); ON_SHUTDOWN=${ON_SHUTDOWN:-suspend}
+if [ "$ON_BOOT" != ignore ] || [ "$ON_SHUTDOWN" != shutdown ]; then
+  echo "${GRAY}Note: host now uses ON_BOOT=$ON_BOOT, ON_SHUTDOWN=$ON_SHUTDOWN in $GUESTS_CONF (applies to all VMs).${RESET}"
+  if read_yes_no "Shut down guests on host shutdown and do not restart them on boot?" y; then
+    CHANGE_GUESTS_CONF=yes
+  fi
+fi
+
+# --- Unique static MAC address in the libvirt range 52:54:00 ---
+USED_MACS=$(for d in $(virsh list --all --name); do virsh domiflist "$d" 2>/dev/null | awk 'NR>2{print tolower($5)}'; done)
+while true; do
+  MAC=$(printf '52:54:00:%02x:%02x:%02x' $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
+  grep -qx "$MAC" <<<"$USED_MACS" || break
+done
+
+# --- Build virt-install arguments ---
+if [ "$OS_TYPE" = 1 ]; then
+  OSINFO=linux2022; DISK_BUS=virtio; NIC_MODEL=virtio
+else
+  OSINFO=win10; DISK_BUS=sata; NIC_MODEL=e1000e
+fi
+
+ARGS=(
+  --name "$VM_NAME"
+  --osinfo "detect=on,require=off,name=$OSINFO"
+  --machine q35
+  --vcpus "$CPU_COUNT"
+  --cpu host-passthrough
+  --memory $((MEM_GB * 1024))
+  --boot "uefi,firmware.feature0.name=secure-boot,firmware.feature0.enabled=$SECURE_BOOT,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=$SECURE_BOOT"
+  --graphics vnc,listen=127.0.0.1
+  --console pty,target.type=serial
+  --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0
+  --import
+  --noautoconsole
+  --print-xml
+)
+[ -n "$ISO" ] && ARGS+=(--disk "path=$ISO,device=cdrom,bus=sata,readonly=on,boot.order=1")
+for ((i = 0; i < DISK_COUNT; i++)); do
+  ARGS+=(--disk "path=${DISK_PATHS[i]},format=qcow2,bus=$DISK_BUS,cache=none,discard=unmap,boot.order=$((i + 2))")
+done
+if [ -n "$NET" ]; then ARGS+=(--network "$NET,model=$NIC_MODEL,mac=$MAC"); else ARGS+=(--network none); fi
+# virt-install adds a TPM to UEFI VMs by default, so "none" is passed explicitly
+if [ "$TPM" = yes ]; then ARGS+=(--tpm "backend.type=emulator,backend.version=2.0,model=tpm-crb"); else ARGS+=(--tpm none); fi
+
+# --- Create disks ---
+DEFINED=no
+trap '[ "$DEFINED" = no ] && [ -d "$VM_DIR" ] && rm -rf -- "$VM_DIR"' EXIT
+mkdir -p "$VM_DIR"
+for ((i = 0; i < DISK_COUNT; i++)); do
+  qemu-img create -q -f qcow2 -o preallocation=metadata "${DISK_PATHS[i]}" "${DISK_SIZES[i]}G" \
+    || die "Could not create disk '${DISK_PATHS[i]}'."
+done
+
+# --- Define the VM (created, not started) ---
+XML=$(virt-install "${ARGS[@]}" 2>&1) || die "virt-install failed: $XML"
+DEF_OUT=$(virsh define /dev/stdin <<<"$XML" 2>&1) || die "virsh define failed: $DEF_OUT"
+DEFINED=yes
+trap - EXIT
+virsh refresh-pool default &>/dev/null || true
+
+# Do not start the VM automatically when the host starts
+virsh autostart --disable "$VM_NAME" >/dev/null
+
+# Host-wide: shut down guests on host shutdown, do not restart them on boot
+if [ "${CHANGE_GUESTS_CONF:-}" = yes ]; then
+  [ -f "$GUESTS_CONF" ] && [ ! -e "$GUESTS_CONF.bak" ] && cp "$GUESTS_CONF" "$GUESTS_CONF.bak"
+  touch "$GUESTS_CONF"
+  for kv in ON_BOOT=ignore ON_SHUTDOWN=shutdown; do
+    k=${kv%%=*}
+    # Replace active lines; commented examples are left as they are
+    if grep -qE "^[[:space:]]*$k=" "$GUESTS_CONF"; then
+      sed -i -E "s|^[[:space:]]*$k=.*|$kv|" "$GUESTS_CONF"
+    else
+      echo "$kv" >> "$GUESTS_CONF"
+    fi
+  done
+  systemctl enable --now libvirt-guests.service &>/dev/null || true
+fi
+
+# --- Summary ---
+nested=$(cat /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested 2>/dev/null | head -n1)
+case $nested in Y|1) nested="available" ;; *) nested="not enabled on the host" ;; esac
+xml=$(virsh dumpxml "$VM_NAME")
+echo
+echo "${GREEN}VM '$VM_NAME' created.${RESET}"
+echo
+printf '  %-19s %s\n' "VM folder:" "$VM_DIR"
+printf '  %-19s %s\n' "vCPU:" "$(virsh vcpucount "$VM_NAME" --maximum --config) (host-passthrough, nested: $nested)"
+printf '  %-19s %s\n' "Memory:" "$MEM_GB GB (static)"
+printf '  %-19s %s\n' "Firmware:" "UEFI, Secure Boot: $([ "$SECURE_BOOT" = yes ] && echo On || echo Off)"
+printf '  %-19s %s\n' "Virtual TPM:" "$(grep -q '<tpm ' <<<"$xml" && echo On || echo Off)"
+OS_ID=$(sed -nE 's|.*<libosinfo:os id="https?://[^/]+/([^"]*)".*|\1|p' <<<"$xml")
+printf '  %-19s %s\n' "Guest OS:" "$([ "$OS_TYPE" = 1 ] && echo Linux || echo Windows) (osinfo: ${OS_ID:-generic})"
+autostart=$(virsh dominfo "$VM_NAME" | awk -F': *' '/^Autostart/{print $2}')
+printf '  %-19s %s\n' "Autostart:" "$([ "$autostart" = enable ] && echo On || echo Off)"
+printf '  %-19s %s\n' "Host shutdown/boot:" "ON_BOOT=$(v=$(conf_value ON_BOOT); echo "${v:-start}"), ON_SHUTDOWN=$(v=$(conf_value ON_SHUTDOWN); echo "${v:-suspend}")"
+if [ -n "$NET" ]; then
+  printf '  %-19s %s\n' "MAC address:" "$MAC (static)"
+fi
+printf '  %-19s %s\n' "Network:" "$NET_LABEL"
+for ((i = 0; i < DISK_COUNT; i++)); do
+  printf '  %-19s %s\n' "Disk:" "${DISK_PATHS[i]} (${DISK_SIZES[i]} GB, qcow2 thin, $DISK_BUS)"
+done
+[ -n "$ISO" ] && printf '  %-19s %s\n' "ISO:" "$ISO (first boot device)"
+[ -n "${TPM_WARNING:-}" ] && { echo; warn "$TPM_WARNING"; }
+
+# --- Start the VM (green prompt, default Yes) ---
+echo
+while true; do
+  read -r -p "${GREEN}Start VM '$VM_NAME' now? [Y/n]: ${RESET}" answer || answer=n
+  answer=$(tr '[:upper:]' '[:lower:]' <<<"${answer//[[:space:]]/}")
+  case $answer in ''|y|yes|n|no) break ;; esac
+done
+if [[ $answer == "" || $answer == y || $answer == yes ]]; then
+  if out=$(virsh start "$VM_NAME" 2>&1); then
+    echo "VM '$VM_NAME' started. Console: Cockpit > Virtual machines > $VM_NAME, or: virsh console $VM_NAME"
+  else
+    echo "${RED}VM '$VM_NAME' was created but could not be started: $out${RESET}"
+    exit 1
+  fi
+else
+  echo "VM '$VM_NAME' was not started."
+fi
+}
+
+# Read answers from the terminal, also when the script itself comes from a pipe (curl | bash)
+main "$@" </dev/tty
