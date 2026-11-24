@@ -467,7 +467,6 @@ conf_value() { grep -E "^[[:space:]]*$1=" "$GUESTS_CONF" 2>/dev/null | tail -n1 
 ON_BOOT=$(conf_value ON_BOOT); ON_BOOT=${ON_BOOT:-start}
 ON_SHUTDOWN=$(conf_value ON_SHUTDOWN); ON_SHUTDOWN=${ON_SHUTDOWN:-suspend}
 if [ "$ON_BOOT" != ignore ] || [ "$ON_SHUTDOWN" != shutdown ]; then
-  echo "${GRAY}Note: host now uses ON_BOOT=$ON_BOOT, ON_SHUTDOWN=$ON_SHUTDOWN in $GUESTS_CONF (applies to all VMs).${RESET}"
   if read_yes_no "Shut down guests on host shutdown and do not restart them on boot?" y; then
     CHANGE_GUESTS_CONF=yes
   fi
