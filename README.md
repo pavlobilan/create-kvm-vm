@@ -4,6 +4,12 @@ Interactive script that creates a KVM/libvirt virtual machine on a Debian host (
 
 ## Quick start
 
+Install `curl` if it is missing (a host installed with kvm-host-iso does not have it):
+
+```bash
+sudo apt-get install -y curl
+```
+
 Download the script and run it as root:
 
 ```bash
