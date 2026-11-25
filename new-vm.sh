@@ -403,7 +403,10 @@ build_vm_iso() {
     /^[[:space:]]*(menuentry|submenu)[[:space:]]/ && $0 !~ /'"'"'Install'"'"'/ {
       d = gsub(/{/, "{") - gsub(/}/, "}"); if (d > 0) skip = 1; next }
     { print }' "$f" > "$f.new" && mv "$f.new" "$f"
-  sed -i "s#\(/install.amd/vmlinuz\)#\1 locale=en_US.UTF-8 keymap=us#" "$f"
+  # nomodeset: the installer keeps the UEFI screen mode; otherwise the virtio-gpu driver switches the screen
+  # to a smaller mode while the installer is running, and its dialogs are cut off on the right.
+  # Installer only (before "---"), the installed system is not affected.
+  sed -i "s#\(/install.amd/vmlinuz\)#\1 locale=en_US.UTF-8 keymap=us nomodeset#" "$f"
   sed -i "/^[[:space:]]*menuentry.*'Install'.*{/a\\    echo 'Loading the installer, please wait...'" "$f"
   printf '\nset timeout=-1\nset default="Install"\n' >> "$f"
   map+=(-map "$f" /boot/grub/grub.cfg)
